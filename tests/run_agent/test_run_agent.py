@@ -1736,6 +1736,50 @@ class TestRunConversation:
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
 
+    def test_delegated_parent_session_id_propagates_to_plugin_hooks(self, agent):
+        self._setup_agent(agent)
+        agent._parent_session_id = "parent-session"
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search delegated")
+
+        assert result["final_response"] == "Done searching"
+
+        pre_llm_calls = [kw for name, kw in hook_calls if name == "pre_llm_call"]
+        pre_request_calls = [kw for name, kw in hook_calls if name == "pre_api_request"]
+        post_request_calls = [kw for name, kw in hook_calls if name == "post_api_request"]
+        session_start_calls = [kw for name, kw in hook_calls if name == "on_session_start"]
+        post_llm_calls = [kw for name, kw in hook_calls if name == "post_llm_call"]
+        session_end_calls = [kw for name, kw in hook_calls if name == "on_session_end"]
+        if session_start_calls:
+            assert all(call["parent_session_id"] == "parent-session" for call in session_start_calls)
+        assert pre_llm_calls
+        assert pre_request_calls
+        assert post_request_calls
+        assert post_llm_calls
+        assert session_end_calls
+        assert all(call["parent_session_id"] == "parent-session" for call in pre_llm_calls)
+        assert all(call["parent_session_id"] == "parent-session" for call in pre_request_calls)
+        assert all(call["parent_session_id"] == "parent-session" for call in post_request_calls)
+        assert all(call["parent_session_id"] == "parent-session" for call in post_llm_calls)
+        assert all(call["parent_session_id"] == "parent-session" for call in session_end_calls)
+
     def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
 
