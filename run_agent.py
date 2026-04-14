@@ -6949,11 +6949,16 @@ class AIAgent:
                 parent_agent=self,
             )
         else:
+            hfc_kwargs = {
+                "tool_call_id": tool_call_id,
+                "session_id": self.session_id or "",
+                "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+            }
+            if self._parent_session_id:
+                hfc_kwargs["parent_session_id"] = self._parent_session_id
             return handle_function_call(
                 function_name, function_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                **hfc_kwargs,
             )
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -7396,11 +7401,16 @@ class AIAgent:
                     spinner.start()
                 _spinner_result = None
                 try:
+                    _hfc_kwargs = {
+                        "tool_call_id": tool_call.id,
+                        "session_id": self.session_id or "",
+                        "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+                    }
+                    if self._parent_session_id:
+                        _hfc_kwargs["parent_session_id"] = self._parent_session_id
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                        **_hfc_kwargs,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -7415,11 +7425,16 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
+                    _hfc_kwargs = {
+                        "tool_call_id": tool_call.id,
+                        "session_id": self.session_id or "",
+                        "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+                    }
+                    if self._parent_session_id:
+                        _hfc_kwargs["parent_session_id"] = self._parent_session_id
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                        **_hfc_kwargs,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -7878,12 +7893,14 @@ class AIAgent:
                 # session-scoped state (e.g. warm a memory cache).
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _invoke_hook(
-                        "on_session_start",
-                        session_id=self.session_id,
-                        model=self.model,
-                        platform=getattr(self, "platform", None) or "",
-                    )
+                    _session_start_hook_kwargs = {
+                        "session_id": self.session_id,
+                        "model": self.model,
+                        "platform": getattr(self, "platform", None) or "",
+                    }
+                    if self._parent_session_id:
+                        _session_start_hook_kwargs["parent_session_id"] = self._parent_session_id
+                    _invoke_hook("on_session_start", **_session_start_hook_kwargs)
                 except Exception as exc:
                     logger.warning("on_session_start hook failed: %s", exc)
 
@@ -7969,16 +7986,18 @@ class AIAgent:
         _plugin_user_context = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _pre_results = _invoke_hook(
-                "pre_llm_call",
-                session_id=self.session_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
-            )
+            _pre_hook_kwargs = {
+                "session_id": self.session_id,
+                "user_message": original_user_message,
+                "conversation_history": list(messages),
+                "is_first_turn": (not bool(conversation_history)),
+                "model": self.model,
+                "platform": getattr(self, "platform", None) or "",
+                "sender_id": getattr(self, "_user_id", None) or "",
+            }
+            if self._parent_session_id:
+                _pre_hook_kwargs["parent_session_id"] = self._parent_session_id
+            _pre_results = _invoke_hook("pre_llm_call", **_pre_hook_kwargs)
             _ctx_parts: list[str] = []
             for r in _pre_results:
                 if isinstance(r, dict) and r.get("context"):
@@ -8260,22 +8279,24 @@ class AIAgent:
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            session_id=self.session_id or "",
-                            platform=self.platform or "",
-                            model=self.model,
-                            provider=self.provider,
-                            base_url=self.base_url,
-                            api_mode=self.api_mode,
-                            api_call_count=api_call_count,
-                            message_count=len(api_messages),
-                            tool_count=len(self.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=self.max_tokens,
-                        )
+                        _pre_api_hook_kwargs = {
+                            "task_id": effective_task_id,
+                            "session_id": self.session_id or "",
+                            "platform": self.platform or "",
+                            "model": self.model,
+                            "provider": self.provider,
+                            "base_url": self.base_url,
+                            "api_mode": self.api_mode,
+                            "api_call_count": api_call_count,
+                            "message_count": len(api_messages),
+                            "tool_count": len(self.tools or []),
+                            "approx_input_tokens": approx_tokens,
+                            "request_char_count": total_chars,
+                            "max_tokens": self.max_tokens,
+                        }
+                        if self._parent_session_id:
+                            _pre_api_hook_kwargs["parent_session_id"] = self._parent_session_id
+                        _invoke_hook("pre_api_request", **_pre_api_hook_kwargs)
                     except Exception:
                         pass
 
@@ -9656,24 +9677,26 @@ class AIAgent:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
                     _assistant_text = assistant_message.content or ""
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        session_id=self.session_id or "",
-                        platform=self.platform or "",
-                        model=self.model,
-                        provider=self.provider,
-                        base_url=self.base_url,
-                        api_mode=self.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        usage=self._usage_summary_for_api_request_hook(response),
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
+                    _post_api_hook_kwargs = {
+                        "task_id": effective_task_id,
+                        "session_id": self.session_id or "",
+                        "platform": self.platform or "",
+                        "model": self.model,
+                        "provider": self.provider,
+                        "base_url": self.base_url,
+                        "api_mode": self.api_mode,
+                        "api_call_count": api_call_count,
+                        "api_duration": api_duration,
+                        "finish_reason": finish_reason,
+                        "message_count": len(api_messages),
+                        "response_model": getattr(response, "model", None),
+                        "usage": self._usage_summary_for_api_request_hook(response),
+                        "assistant_content_chars": len(_assistant_text),
+                        "assistant_tool_call_count": len(_assistant_tool_calls),
+                    }
+                    if self._parent_session_id:
+                        _post_api_hook_kwargs["parent_session_id"] = self._parent_session_id
+                    _invoke_hook("post_api_request", **_post_api_hook_kwargs)
                 except Exception:
                     pass
 
@@ -10484,15 +10507,17 @@ class AIAgent:
         if final_response and not interrupted:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "post_llm_call",
-                    session_id=self.session_id,
-                    user_message=original_user_message,
-                    assistant_response=final_response,
-                    conversation_history=list(messages),
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
-                )
+                _post_llm_hook_kwargs = {
+                    "session_id": self.session_id,
+                    "user_message": original_user_message,
+                    "assistant_response": final_response,
+                    "conversation_history": list(messages),
+                    "model": self.model,
+                    "platform": getattr(self, "platform", None) or "",
+                }
+                if self._parent_session_id:
+                    _post_llm_hook_kwargs["parent_session_id"] = self._parent_session_id
+                _invoke_hook("post_llm_call", **_post_llm_hook_kwargs)
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
 
@@ -10583,14 +10608,16 @@ class AIAgent:
         # Plugins can use this for cleanup, flushing buffers, etc.
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "on_session_end",
-                session_id=self.session_id,
-                completed=completed,
-                interrupted=interrupted,
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-            )
+            _session_end_hook_kwargs = {
+                "session_id": self.session_id,
+                "completed": completed,
+                "interrupted": interrupted,
+                "model": self.model,
+                "platform": getattr(self, "platform", None) or "",
+            }
+            if self._parent_session_id:
+                _session_end_hook_kwargs["parent_session_id"] = self._parent_session_id
+            _invoke_hook("on_session_end", **_session_end_hook_kwargs)
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 

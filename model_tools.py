@@ -458,25 +458,25 @@ def _coerce_boolean(value: str):
 
 def handle_function_call(
     function_name: str,
-    function_args: Dict[str, Any],
-    task_id: Optional[str] = None,
-    tool_call_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    user_task: Optional[str] = None,
-    enabled_tools: Optional[List[str]] = None,
+    function_args: dict,
+    task_id: str = None,
+    user_task: str = None,
+    tool_call_id: str = None,
+    session_id: str = None,
+    parent_session_id: str = None,
+    enabled_tools: Optional[list[str]] = None,
 ) -> str:
-    """
-    Main function call dispatcher that routes calls to the tool registry.
+    """Main function call dispatcher that routes calls to the tool registry.
 
     Args:
-        function_name: Name of the function to call.
-        function_args: Arguments for the function.
-        task_id: Unique identifier for terminal/browser session isolation.
+        function_name: Name of the tool to execute.
+        function_args: Parsed JSON arguments for the tool.
+        task_id: Optional task/session id for long-running tools.
         user_task: The user's original task (for browser_snapshot context).
-        enabled_tools: Tool names enabled for this session.  When provided,
-                       execute_code uses this list to determine which sandbox
-                       tools to generate.  Falls back to the process-global
-                       ``_last_resolved_tool_names`` for backward compat.
+        tool_call_id: Optional unique tool-call identifier from the LLM response.
+        session_id: Optional agent session identifier for plugin hooks.
+        parent_session_id: Optional parent agent session identifier for delegated child sessions.
+        enabled_tools: Optional explicit allowed-tool list for sandboxed execution.
 
     Returns:
         Function result as a JSON string.
@@ -499,14 +499,16 @@ def handle_function_call(
 
         try:
             from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "pre_tool_call",
-                tool_name=function_name,
-                args=function_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-            )
+            pre_hook_kwargs = {
+                "tool_name": function_name,
+                "args": function_args,
+                "task_id": task_id or "",
+                "session_id": session_id or "",
+                "tool_call_id": tool_call_id or "",
+            }
+            if parent_session_id:
+                pre_hook_kwargs["parent_session_id"] = parent_session_id
+            invoke_hook("pre_tool_call", **pre_hook_kwargs)
         except Exception:
             pass
 
@@ -528,15 +530,17 @@ def handle_function_call(
 
         try:
             from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "post_tool_call",
-                tool_name=function_name,
-                args=function_args,
-                result=result,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-            )
+            post_hook_kwargs = {
+                "tool_name": function_name,
+                "args": function_args,
+                "result": result,
+                "task_id": task_id or "",
+                "session_id": session_id or "",
+                "tool_call_id": tool_call_id or "",
+            }
+            if parent_session_id:
+                post_hook_kwargs["parent_session_id"] = parent_session_id
+            invoke_hook("post_tool_call", **post_hook_kwargs)
         except Exception:
             pass
 
