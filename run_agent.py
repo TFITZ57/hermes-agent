@@ -78,6 +78,10 @@ from hermes_constants import OPENROUTER_BASE_URL
 from agent.memory_manager import build_memory_context_block
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.gbrain_runtime import (
+    prefetch_brain_context_for_message,
+    perform_post_conversation_brain_writeback,
+)
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -2736,6 +2740,65 @@ class AIAgent:
         summary["total_tokens"] = cu.total_tokens
         return summary
 
+    def _invoke_plugin_hook_safe(self, hook_name: str, **kwargs) -> list[Any]:
+        """Best-effort plugin hook invocation with session lineage attached."""
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            hook_kwargs = dict(kwargs)
+            hook_kwargs.setdefault("session_id", self.session_id)
+            if self._parent_session_id and "parent_session_id" not in hook_kwargs:
+                hook_kwargs["parent_session_id"] = self._parent_session_id
+            return _invoke_hook(hook_name, **hook_kwargs)
+        except Exception:
+            return []
+
+    def _memory_hook_context(self) -> Dict[str, Any]:
+        """Shared metadata for memory lifecycle hook payloads."""
+        provider_names: list[str] = []
+        external_provider = ""
+        if self._memory_manager:
+            provider_names = [
+                str(getattr(provider, "name", ""))
+                for provider in self._memory_manager.providers
+                if str(getattr(provider, "name", ""))
+            ]
+            external_provider = next(
+                (name for name in provider_names if name != "builtin"),
+                "",
+            )
+
+        context: Dict[str, Any] = {
+            "model": self.model or "",
+            "platform": self.platform or "cli",
+            "tool_names": list(self.valid_tool_names) if self.valid_tool_names else [],
+            "provider_names": provider_names,
+        }
+        if external_provider:
+            context["external_provider"] = external_provider
+        return context
+
+    def _emit_direct_tool_hooks(
+        self,
+        function_name: str,
+        function_args: dict,
+        *,
+        task_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        result: Optional[str] = None,
+    ) -> None:
+        """Emit pre/post tool hooks for agent-loop tools that bypass model_tools."""
+        hook_kwargs = {
+            "tool_name": function_name,
+            "args": function_args,
+            "task_id": task_id or "",
+            "tool_call_id": tool_call_id or "",
+        }
+        if result is None:
+            self._invoke_plugin_hook_safe("pre_tool_call", **hook_kwargs)
+        else:
+            self._invoke_plugin_hook_safe("post_tool_call", result=result, **hook_kwargs)
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
@@ -3202,6 +3265,8 @@ class AIAgent:
             prompt_parts.append(system_message)
 
         if self._memory_store:
+            mem_block = ""
+            user_block = ""
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
@@ -3211,7 +3276,11 @@ class AIAgent:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+        else:
+            mem_block = ""
+            user_block = ""
 
+        _ext_mem_block = ""
         # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
             try:
@@ -3220,6 +3289,18 @@ class AIAgent:
                     prompt_parts.append(_ext_mem_block)
             except Exception:
                 pass
+
+        total_memory_chars = len(mem_block) + len(user_block) + len(_ext_mem_block)
+        if total_memory_chars > 0:
+            self._invoke_plugin_hook_safe(
+                "on_memory_inject",
+                memory_chars=len(mem_block),
+                user_chars=len(user_block),
+                external_chars=len(_ext_mem_block),
+                total_chars=total_memory_chars,
+                estimated_tokens=(total_memory_chars + 3) // 4,
+                **self._memory_hook_context(),
+            )
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
@@ -6898,17 +6979,38 @@ class AIAgent:
                 store=self._todo_store,
             )
         elif function_name == "session_search":
-            if not self._session_db:
-                return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
             )
+            if not self._session_db:
+                result = json.dumps({"success": False, "error": "Session database not available."})
+            else:
+                from tools.session_search_tool import session_search as _session_search
+                result = _session_search(
+                    query=function_args.get("query", ""),
+                    role_filter=function_args.get("role_filter"),
+                    limit=function_args.get("limit", 3),
+                    db=self._session_db,
+                    current_session_id=self.session_id,
+                )
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                result=result,
+            )
+            return result
         elif function_name == "memory":
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+            )
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
@@ -6928,9 +7030,30 @@ class AIAgent:
                     )
                 except Exception:
                     pass
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                result=result,
+            )
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+            )
+            result = self._memory_manager.handle_tool_call(function_name, function_args)
+            self._emit_direct_tool_hooks(
+                function_name,
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                result=result,
+            )
+            return result
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
@@ -7274,6 +7397,12 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
+                self._emit_direct_tool_hooks(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                )
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
@@ -7285,10 +7414,23 @@ class AIAgent:
                         db=self._session_db,
                         current_session_id=self.session_id,
                     )
+                self._emit_direct_tool_hooks(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                    result=function_result,
+                )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
+                self._emit_direct_tool_hooks(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                )
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
                 function_result = _memory_tool(
@@ -7297,6 +7439,22 @@ class AIAgent:
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
+                )
+                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                    try:
+                        self._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            target,
+                            function_args.get("content", ""),
+                        )
+                    except Exception:
+                        pass
+                self._emit_direct_tool_hooks(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                    result=function_result,
                 )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
@@ -7370,6 +7528,12 @@ class AIAgent:
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
                 # Memory provider tools (hindsight_retain, honcho_search, etc.)
                 # These are not in the tool registry — route through MemoryManager.
+                self._emit_direct_tool_hooks(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                )
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
@@ -7385,6 +7549,13 @@ class AIAgent:
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
+                    self._emit_direct_tool_hooks(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id,
+                        tool_call_id=tool_call.id,
+                        result=function_result,
+                    )
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
                     if spinner:
@@ -8035,11 +8206,33 @@ class AIAgent:
         # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
         if self._memory_manager:
+            _prefetch_started_at = time.time()
+            _query = original_user_message if isinstance(original_user_message, str) else ""
             try:
-                _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(
+                    _query,
+                    session_id=self.session_id,
+                ) or ""
             except Exception:
                 pass
+            finally:
+                _result_chars = len(_ext_prefetch_cache or "")
+                self._invoke_plugin_hook_safe(
+                    "on_memory_recall",
+                    query=_query,
+                    result_chars=_result_chars,
+                    estimated_tokens=(_result_chars + 3) // 4,
+                    duration_ms=int((time.time() - _prefetch_started_at) * 1000),
+                    has_result=bool(_ext_prefetch_cache and _ext_prefetch_cache.strip()),
+                    **self._memory_hook_context(),
+                )
+
+        _brain_prefetch = None
+        if "gbrain_lookup" in self.valid_tool_names and original_user_message:
+            try:
+                _brain_prefetch = prefetch_brain_context_for_message(original_user_message)
+            except Exception as exc:
+                logger.warning("brain prefetch failed: %s", exc)
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -8117,6 +8310,8 @@ class AIAgent:
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
+                    if _brain_prefetch and getattr(_brain_prefetch, "context_block", ""):
+                        _injections.append(_brain_prefetch.context_block)
                     if _ext_prefetch_cache:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
@@ -10532,6 +10727,10 @@ class AIAgent:
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,
+            "brain_prefetch": {
+                "target_slugs": list(getattr(_brain_prefetch, "target_slugs", []) or []),
+                "archive_filtered_count": int(getattr(_brain_prefetch, "archive_filtered_count", 0) or 0),
+            } if _brain_prefetch else None,
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,
@@ -10574,15 +10773,56 @@ class AIAgent:
             _should_review_skills = True
             self._iters_since_skill = 0
 
+        _brain_writeback_summary = None
+        if "gbrain_lookup" in self.valid_tool_names and final_response and original_user_message:
+            try:
+                _brain_writeback_summary = perform_post_conversation_brain_writeback(
+                    user_message=original_user_message,
+                    assistant_response=final_response,
+                    target_slugs=list(getattr(_brain_prefetch, "target_slugs", []) or []),
+                )
+            except Exception as exc:
+                logger.warning("brain writeback failed: %s", exc)
+                _brain_writeback_summary = {
+                    "writes_performed": False,
+                    "error": str(exc),
+                }
+            try:
+                self._invoke_plugin_hook_safe(
+                    "post_conversation_enrichment",
+                    user_message=original_user_message,
+                    assistant_response=final_response,
+                    brain_writeback=_brain_writeback_summary or {},
+                )
+            except Exception:
+                pass
+            result["brain_writeback"] = _brain_writeback_summary
+
         # External memory provider: sync the completed turn + queue next prefetch.
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
+            _sync_started_at = time.time()
             try:
-                self._memory_manager.sync_all(original_user_message, final_response)
-                self._memory_manager.queue_prefetch_all(original_user_message)
+                self._memory_manager.sync_all(
+                    original_user_message,
+                    final_response,
+                    session_id=self.session_id,
+                )
+                self._memory_manager.queue_prefetch_all(
+                    original_user_message,
+                    session_id=self.session_id,
+                )
             except Exception:
                 pass
+            finally:
+                self._invoke_plugin_hook_safe(
+                    "on_memory_sync",
+                    user_chars=len(original_user_message or ""),
+                    assistant_chars=len(final_response or ""),
+                    duration_ms=int((time.time() - _sync_started_at) * 1000),
+                    **self._memory_hook_context(),
+                )
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.

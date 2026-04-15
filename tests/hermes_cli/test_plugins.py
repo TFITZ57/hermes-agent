@@ -143,6 +143,22 @@ class TestPluginDiscovery:
 class TestPluginLoading:
     """Tests for plugin module loading."""
 
+    def test_load_opik_tracer_applies_compat_patch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        mgr = PluginManager()
+        manifest = PluginManifest(name="opik-tracer", source="user", path=str(tmp_path / "opik-tracer"))
+        fake_module = types.ModuleType("fake_opik_plugin")
+        fake_module.register = lambda ctx: None  # type: ignore[attr-defined]
+
+        with (
+            patch.object(mgr, "_load_directory_module", return_value=fake_module),
+            patch("agent.opik_tracer_compat.patch_external_opik_tracer", return_value=fake_module) as mock_patch,
+        ):
+            mgr._load_plugin(manifest)
+
+        mock_patch.assert_called_once_with(fake_module)
+        assert mgr._plugins["opik-tracer"].enabled
+
     def test_load_missing_init(self, tmp_path, monkeypatch):
         """Plugin dir without __init__.py records an error."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -198,6 +214,11 @@ class TestPluginHooks:
     def test_valid_hooks_include_request_scoped_api_hooks(self):
         assert "pre_api_request" in VALID_HOOKS
         assert "post_api_request" in VALID_HOOKS
+
+    def test_valid_hooks_include_memory_lifecycle_hooks(self):
+        assert "on_memory_inject" in VALID_HOOKS
+        assert "on_memory_recall" in VALID_HOOKS
+        assert "on_memory_sync" in VALID_HOOKS
 
     def test_register_and_invoke_hook(self, tmp_path, monkeypatch):
         """Registered hooks are called on invoke_hook()."""

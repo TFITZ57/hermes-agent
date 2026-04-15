@@ -13,7 +13,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -1488,6 +1488,94 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_invoke_tool_emits_hooks_for_session_search(self, agent):
+        agent._session_db = MagicMock()
+
+        with (
+            patch("tools.session_search_tool.session_search", return_value='{"ok":true}'),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            result = agent._invoke_tool("session_search", {"query": "history"}, "task-1", tool_call_id="call-1")
+
+        assert result == '{"ok":true}'
+        assert mock_invoke_hook.call_args_list == [
+            call(
+                "pre_tool_call",
+                tool_name="session_search",
+                args={"query": "history"},
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id=agent.session_id,
+            ),
+            call(
+                "post_tool_call",
+                tool_name="session_search",
+                args={"query": "history"},
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id=agent.session_id,
+                result='{"ok":true}',
+            ),
+        ]
+
+    def test_invoke_tool_emits_hooks_for_memory_tool(self, agent):
+        with (
+            patch("tools.memory_tool.memory_tool", return_value='{"ok":true}'),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "remember this"},
+                "task-1",
+                tool_call_id="call-1",
+            )
+
+        assert result == '{"ok":true}'
+        assert mock_invoke_hook.call_args_list == [
+            call(
+                "pre_tool_call",
+                tool_name="memory",
+                args={"action": "add", "target": "memory", "content": "remember this"},
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id=agent.session_id,
+            ),
+            call(
+                "post_tool_call",
+                tool_name="memory",
+                args={"action": "add", "target": "memory", "content": "remember this"},
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id=agent.session_id,
+                result='{"ok":true}',
+            ),
+        ]
+
+    def test_build_system_prompt_emits_memory_inject_hook(self, agent):
+        agent.skip_memory = False
+        agent._memory_enabled = True
+        agent._user_profile_enabled = True
+        agent._memory_store = MagicMock()
+        agent._memory_store.format_for_system_prompt.side_effect = ["MEM", "USER"]
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "EXT"
+        agent._memory_manager.providers = [SimpleNamespace(name="builtin"), SimpleNamespace(name="byterover")]
+
+        with patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook:
+            agent._build_system_prompt()
+
+        memory_calls = [c for c in mock_invoke_hook.call_args_list if c.args and c.args[0] == "on_memory_inject"]
+        assert len(memory_calls) == 1
+        _, kwargs = memory_calls[0]
+        assert kwargs["memory_chars"] == 3
+        assert kwargs["user_chars"] == 4
+        assert kwargs["external_chars"] == 3
+        assert kwargs["total_chars"] == 10
+        assert kwargs["estimated_tokens"] == 3
+        assert kwargs["provider_names"] == ["builtin", "byterover"]
+        assert kwargs["external_provider"] == "byterover"
+        assert kwargs["session_id"] == agent.session_id
 
 
 class TestPathsOverlap:

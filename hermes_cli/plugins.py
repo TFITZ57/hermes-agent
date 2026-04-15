@@ -58,6 +58,9 @@ VALID_HOOKS: Set[str] = {
     "post_llm_call",
     "pre_api_request",
     "post_api_request",
+    "on_memory_inject",
+    "on_memory_recall",
+    "on_memory_sync",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -407,6 +410,14 @@ class PluginManager:
                 module = self._load_entrypoint_module(manifest)
 
             loaded.module = module
+
+            if manifest.name == "opik-tracer":
+                try:
+                    from agent.opik_tracer_compat import patch_external_opik_tracer
+                    module = patch_external_opik_tracer(module)
+                    loaded.module = module
+                except Exception as exc:
+                    logger.warning("Failed to apply opik-tracer compat patch: %s", exc)
 
             # Call register()
             register_fn = getattr(module, "register", None)
