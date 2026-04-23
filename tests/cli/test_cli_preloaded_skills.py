@@ -92,6 +92,43 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
+def test_main_accepts_ignore_flags_and_skips_preloaded_skills(monkeypatch):
+    import cli as cli_mod
+
+    created = {}
+    preload_calls = []
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+    monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda *args, **kwargs: preload_calls.append((args, kwargs)),
+    )
+
+    try:
+        with pytest.raises(SystemExit):
+            cli_mod.main(
+                skills="hermes-agent-dev",
+                ignore_rules=True,
+                ignore_user_config=True,
+                list_tools=True,
+            )
+    finally:
+        os.environ.pop("HERMES_IGNORE_RULES", None)
+        os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+
+    cli_obj = created["cli"]
+    assert cli_obj.kwargs["ignore_rules"] is True
+    assert cli_obj.preloaded_skills == []
+    assert preload_calls == []
+
+
 def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     import cli as cli_mod
 
@@ -111,8 +148,11 @@ def test_show_banner_does_not_print_skills():
     cli_obj = _make_real_cli(compact=False)
     cli_obj.preloaded_skills = ["hermes-agent-dev", "github-auth"]
     cli_obj.console = MagicMock()
+    mock_banner = MagicMock()
 
-    with patch("cli.build_welcome_banner") as mock_banner, patch(
+    with patch.dict(
+        cli_obj.show_banner.__globals__, {"build_welcome_banner": mock_banner}
+    ), patch(
         "shutil.get_terminal_size", return_value=os.terminal_size((120, 40))
     ):
         cli_obj.show_banner()

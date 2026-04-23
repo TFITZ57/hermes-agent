@@ -280,8 +280,11 @@ def load_cli_config() -> Dict[str, Any]:
     user_config_path = _hermes_home / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
 
-    # Use user config if it exists, otherwise project config
-    if user_config_path.exists():
+    # Use user config if it exists, unless this launch requested isolation.
+    if (
+        user_config_path.exists()
+        and os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1"
+    ):
         config_path = user_config_path
     else:
         config_path = project_config_path
@@ -1772,6 +1775,7 @@ class HermesCLI:
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        ignore_rules: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -1787,10 +1791,14 @@ class HermesCLI:
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            ignore_rules: Skip context-file and persistent-memory injection
         """
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        self.ignore_rules = (
+            bool(ignore_rules) or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        )
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -3276,6 +3284,8 @@ class HermesCLI:
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
+                skip_memory=self.ignore_rules,
+                skip_context_files=self.ignore_rules,
 
                 fallback_model=self._fallback_model,
                 thinking_callback=self._on_thinking,
@@ -6330,6 +6340,8 @@ class HermesCLI:
                     session_id=task_id,
                     platform="cli",
                     session_db=self._session_db,
+                    skip_memory=self.ignore_rules,
+                    skip_context_files=self.ignore_rules,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -10821,6 +10833,8 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    ignore_rules: bool = False,
+    ignore_user_config: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -10843,6 +10857,8 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        ignore_rules: Skip context-file, persistent-memory, and preloaded-skill injection
+        ignore_user_config: Skip user config for downstream config reads
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -10855,7 +10871,16 @@ def main(
         python cli.py -w                         # Start in isolated git worktree
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
-    global _active_worktree
+    global _active_worktree, CLI_CONFIG
+
+    if ignore_user_config:
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+        CLI_CONFIG = load_cli_config()
+    if ignore_rules:
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+    ignore_rules_enabled = (
+        bool(ignore_rules) or os.environ.get("HERMES_IGNORE_RULES") == "1"
+    )
 
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
@@ -10915,7 +10940,7 @@ def main(
         from hermes_cli.tools_config import _get_platform_tools
         toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
-    parsed_skills = _parse_skills_argument(skills)
+    parsed_skills = [] if ignore_rules_enabled else _parse_skills_argument(skills)
 
     # Create CLI instance
     cli = HermesCLI(
@@ -10930,6 +10955,7 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
+        ignore_rules=ignore_rules_enabled,
     )
 
     if parsed_skills:
