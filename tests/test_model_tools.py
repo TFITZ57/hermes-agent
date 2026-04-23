@@ -72,6 +72,15 @@ class TestHandleFunctionCall:
                 session_id="session-1",
                 tool_call_id="call-1",
             ),
+            call(
+                "transform_tool_result",
+                tool_name="web_search",
+                args={"q": "test"},
+                result='{"ok":true}',
+                task_id="task-1",
+                session_id="session-1",
+                tool_call_id="call-1",
+            ),
         ]
 
     def test_tool_hooks_receive_parent_session_id(self):
@@ -108,6 +117,15 @@ class TestHandleFunctionCall:
                 session_id="child-session",
                 tool_call_id="call-1",
                 parent_session_id="parent-session",
+            ),
+            call(
+                "transform_tool_result",
+                tool_name="web_search",
+                args={"q": "test"},
+                result='{"ok":true}',
+                task_id="task-1",
+                session_id="child-session",
+                tool_call_id="call-1",
             ),
         ]
 
