@@ -108,11 +108,6 @@ def _strip_reasoning_tags(text: str) -> str:
     ``<thought>`` (Gemma 4).  Must stay in sync with
     ``run_agent.py::_strip_think_blocks`` and the stream consumer's
     ``_OPEN_THINK_TAGS`` / ``_CLOSE_THINK_TAGS`` tuples.
-
-    Also strips tool-call XML blocks some open models leak into visible
-    content (``<tool_call>``, ``<function_calls>``, Gemma-style
-    ``<function name="…">…</function>``). Ported from
-    openclaw/openclaw#67318.
     """
     cleaned = text
     for tag in _REASONING_TAGS:
@@ -137,31 +132,6 @@ def _strip_reasoning_tags(text: str) -> str:
             cleaned,
             flags=re.IGNORECASE,
         )
-    # Tool-call XML blocks (openclaw/openclaw#67318).
-    for tc_tag in ("tool_call", "tool_calls", "tool_result",
-                   "function_call", "function_calls"):
-        cleaned = re.sub(
-            rf"<{tc_tag}\b[^>]*>.*?</{tc_tag}>\s*",
-            "",
-            cleaned,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-    # <function name="..."> — boundary + attribute gated to avoid prose FPs.
-    cleaned = re.sub(
-        r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
-        r'<function\b[^>]*\bname\s*=[^>]*>'
-        r'(?:(?:(?!</function>).)*)</function>\s*',
-        '',
-        cleaned,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    # Stray tool-call close tags.
-    cleaned = re.sub(
-        r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
-        '',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
     return cleaned.strip()
 
 
@@ -305,23 +275,13 @@ def load_cli_config() -> Dict[str, Any]:
     
     Environment variables take precedence over config file values.
     Returns default values if no config file exists.
-
-    If HERMES_IGNORE_USER_CONFIG=1 is set (via ``hermes chat --ignore-user-config``),
-    the user config at ``~/.hermes/config.yaml`` is skipped entirely and only the
-    built-in defaults plus the project-level ``cli-config.yaml`` (if any) are used.
-    Credentials in ``.env`` are still loaded — this flag only suppresses
-    behavioral/config settings.
     """
     # Check user config first ({HERMES_HOME}/config.yaml)
     user_config_path = _hermes_home / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
 
-    # --ignore-user-config: force-skip the user config.yaml (still honor project
-    # config as a fallback so defaults stay sensible).
-    ignore_user_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
-
     # Use user config if it exists, otherwise project config
-    if user_config_path.exists() and not ignore_user_config:
+    if user_config_path.exists():
         config_path = user_config_path
     else:
         config_path = project_config_path
@@ -1812,7 +1772,6 @@ class HermesCLI:
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
-        ignore_rules: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -1966,11 +1925,6 @@ class HermesCLI:
         self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
         self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 50)
         self.pass_session_id = pass_session_id
-        # --ignore-rules: honor either the constructor flag or the env var set
-        # by `hermes chat --ignore-rules` in hermes_cli/main.py. When true we
-        # pass skip_context_files=True and skip_memory=True to AIAgent so
-        # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
-        self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -3328,8 +3282,6 @@ class HermesCLI:
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
                 pass_session_id=self.pass_session_id,
-                skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
@@ -5887,9 +5839,31 @@ class HermesCLI:
         # Resolve aliases via central registry so adding an alias is a one-line
         # change in hermes_cli/commands.py instead of touching every dispatch site.
         from hermes_cli.commands import resolve_command as _resolve_cmd
+        from agent.runtime_event_telemetry import emit_command_execute as _emit_command_execute
+        _parts = cmd_original.split(maxsplit=1)
+        _base_token = _parts[0] if _parts else cmd_original
+        _args_text = _parts[1].strip() if len(_parts) > 1 else ""
         _base_word = cmd_lower.split()[0].lstrip("/")
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
+
+        def _track_command(kind: str, *, canonical_name: str = "", redirect_target: str = "") -> None:
+            _emit_command_execute(
+                raw_command=_base_token,
+                canonical_command=canonical_name or canonical,
+                command_kind=kind,
+                source_surface="cli",
+                platform="cli",
+                session_id=self.session_id or "",
+                args_text=_args_text,
+                redirect_target=redirect_target,
+                active_agent_running=bool(getattr(self, "_agent_running", False)),
+            )
+
+        if _cmd_def:
+            _track_command("builtin", canonical_name=canonical)
+        elif canonical == "plan":
+            _track_command("builtin", canonical_name="plan")
         
         if canonical in ("quit", "exit", "q"):
             return False
@@ -6172,6 +6146,7 @@ class HermesCLI:
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
+                    _track_command("quick-exec", canonical_name=base_cmd.lstrip("/"))
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
@@ -6197,6 +6172,7 @@ class HermesCLI:
                         target = target if target.startswith("/") else f"/{target}"
                         user_args = cmd_original[len(base_cmd):].strip()
                         aliased_command = f"{target} {user_args}".strip()
+                        _track_command("quick-alias", canonical_name=base_cmd.lstrip("/"), redirect_target=target.lstrip("/"))
                         return self.process_command(aliased_command)
                     else:
                         self._console_print(f"[bold red]Quick command '{base_cmd}' has no target defined[/]")
@@ -6204,6 +6180,7 @@ class HermesCLI:
                     self._console_print(f"[bold red]Quick command '{base_cmd}' has unsupported type (supported: 'exec', 'alias')[/]")
             # Check for plugin-registered slash commands
             elif base_cmd.lstrip("/") in _get_plugin_cmd_handler_names():
+                _track_command("plugin", canonical_name=base_cmd.lstrip("/"))
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
                 if plugin_handler:
@@ -6216,9 +6193,15 @@ class HermesCLI:
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
+                _track_command("skill", canonical_name=base_cmd.lstrip("/"))
                 user_instruction = cmd_original[len(base_cmd):].strip()
                 msg = build_skill_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
+                    base_cmd,
+                    user_instruction,
+                    task_id=self.session_id,
+                    platform="cli",
+                    source_surface="cli",
+                    telemetry_session_id=self.session_id,
                 )
                 if msg:
                     skill_name = _skill_commands[base_cmd]["name"]
@@ -6260,6 +6243,7 @@ class HermesCLI:
                     else:
                         remainder = cmd_original.strip()[len(typed_base):]
                         full_cmd = full_name + remainder
+                        _track_command("prefix-alias", canonical_name=typed_base.lstrip("/"), redirect_target=full_name.lstrip("/"))
                         return self.process_command(full_cmd)
                 elif len(matches) > 1:
                     _cprint(f"{_ACCENT}Ambiguous command: {cmd_lower}{_RST}")
@@ -6284,6 +6268,9 @@ class HermesCLI:
                 "Save the markdown plan with write_file to this exact relative path "
                 f"inside the active workspace/backend cwd: {plan_path}"
             ),
+            platform="cli",
+            source_surface="cli",
+            telemetry_session_id=self.session_id,
         )
 
         if not msg:
@@ -10834,8 +10821,6 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
-    ignore_user_config: bool = False,
-    ignore_rules: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -10945,13 +10930,14 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
-        ignore_rules=ignore_rules,
     )
 
     if parsed_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
             parsed_skills,
             task_id=cli.session_id,
+            platform="cli",
+            source_surface="cli",
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)

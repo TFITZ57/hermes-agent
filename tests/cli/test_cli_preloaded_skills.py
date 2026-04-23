@@ -81,7 +81,7 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("skill prompt", ["hermes-agent-dev", "github-auth"], []),
+        lambda skills, task_id=None, **kwargs: ("skill prompt", ["hermes-agent-dev", "github-auth"], []),
     )
 
     with pytest.raises(SystemExit):
@@ -99,7 +99,7 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("", [], ["missing-skill"]),
+        lambda skills, task_id=None, **kwargs: ("", [], ["missing-skill"]),
     )
 
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):

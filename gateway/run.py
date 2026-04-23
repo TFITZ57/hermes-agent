@@ -2687,9 +2687,8 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
 
-            from gateway.status import remove_pid_file, release_gateway_runtime_lock
+            from gateway.status import remove_pid_file
             remove_pid_file()
-            release_gateway_runtime_lock()
 
             # Write a clean-shutdown marker so the next startup knows this
             # wasn't a crash.  suspend_recently_active() only needs to run
@@ -3486,72 +3485,64 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
+        
+        # Emit command:* hook for any recognized slash command.
+        # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
+        # in hermes_cli/commands.py — no hardcoded set to maintain here.
+        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command as _resolve_cmd
+        from agent.runtime_event_telemetry import emit_command_execute as _emit_command_execute
+        _telemetry_session_entry = [None]
 
-        from hermes_cli.commands import (
-            GATEWAY_KNOWN_COMMANDS,
-            is_gateway_known_command,
-            resolve_command as _resolve_cmd,
-        )
+        def _get_command_session_entry():
+            if _telemetry_session_entry[0] is not None:
+                return _telemetry_session_entry[0]
+            try:
+                _telemetry_session_entry[0] = self.session_store.get_or_create_session(source)
+            except Exception:
+                _telemetry_session_entry[0] = None
+            return _telemetry_session_entry[0]
 
-        # Resolve aliases to canonical name so dispatch and hook names
-        # don't depend on the exact alias the user typed.
-        _cmd_def = _resolve_cmd(command) if command else None
-        canonical = _cmd_def.name if _cmd_def else command
+        def _get_command_session_id() -> str:
+            entry = _get_command_session_entry()
+            return getattr(entry, "session_id", "") or ""
 
-        # Fire the ``command:<canonical>`` hook for any recognized slash
-        # command — built-in OR plugin-registered. Handlers can return a
-        # dict with ``{"decision": "deny" | "handled" | "rewrite", ...}``
-        # to intercept dispatch before core handling runs. This replaces
-        # the previous fire-and-forget emit(): return values are now
-        # honored, but handlers that return nothing behave exactly as
-        # before (telemetry-style hooks keep working).
-        if command and is_gateway_known_command(canonical):
-            raw_args = event.get_command_args().strip()
-            hook_ctx = {
+        def _get_command_session_key() -> str:
+            entry = _get_command_session_entry()
+            return getattr(entry, "session_key", "") or _quick_key
+
+        def _track_command(kind: str, *, raw_command: str, canonical_name: str = "", redirect_target: str = "") -> None:
+            _emit_command_execute(
+                raw_command=raw_command,
+                canonical_command=canonical_name or command or "",
+                command_kind=kind,
+                source_surface="gateway",
+                platform=source.platform.value if source.platform else "",
+                session_id=_get_command_session_id(),
+                gateway_session_key=_get_command_session_key(),
+                user_id=source.user_id or "",
+                chat_id=getattr(source, "chat_id", "") or "",
+                thread_id=getattr(source, "thread_id", "") or "",
+                message_id=getattr(event, "message_id", "") or "",
+                args_text=event.get_command_args().strip(),
+                redirect_target=redirect_target,
+                active_agent_running=bool(self._running_agents.get(_quick_key)),
+            )
+
+        if command and command in GATEWAY_KNOWN_COMMANDS:
+            await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
-                "command": canonical,
-                "raw_command": command,
-                "args": raw_args,
-                "raw_args": raw_args,
-            }
-            try:
-                hook_results = await self.hooks.emit_collect(
-                    f"command:{canonical}", hook_ctx
-                )
-            except Exception as _hook_err:
-                logger.debug(
-                    "command:%s hook dispatch failed (non-fatal): %s",
-                    canonical, _hook_err,
-                )
-                hook_results = []
+                "command": command,
+                "args": event.get_command_args().strip(),
+            })
 
-            for hook_result in hook_results:
-                if not isinstance(hook_result, dict):
-                    continue
-                decision = str(hook_result.get("decision", "")).strip().lower()
-                if not decision or decision == "allow":
-                    continue
-                if decision == "deny":
-                    message = hook_result.get("message")
-                    if isinstance(message, str) and message:
-                        return message
-                    return f"Command `/{command}` was blocked by a hook."
-                if decision == "handled":
-                    message = hook_result.get("message")
-                    return message if isinstance(message, str) and message else None
-                if decision == "rewrite":
-                    new_command = str(
-                        hook_result.get("command_name", "")
-                    ).strip().lstrip("/")
-                    if not new_command:
-                        continue
-                    new_args = str(hook_result.get("raw_args", "")).strip()
-                    event.text = f"/{new_command} {new_args}".strip()
-                    command = event.get_command()
-                    _cmd_def = _resolve_cmd(command) if command else None
-                    canonical = _cmd_def.name if _cmd_def else command
-                    break
+        # Resolve aliases to canonical name so dispatch only checks canonicals.
+        _cmd_def = _resolve_cmd(command) if command else None
+        canonical = _cmd_def.name if _cmd_def else command
+        if _cmd_def:
+            _track_command("builtin", raw_command=f"/{command}", canonical_name=canonical)
+        elif canonical == "plan" and command:
+            _track_command("builtin", raw_command=f"/{command}", canonical_name="plan")
 
         if canonical == "new":
             return await self._handle_reset_command(event)
@@ -3612,10 +3603,19 @@ class GatewayRunner:
                         "Save the markdown plan with write_file to this exact relative path "
                         f"inside the active workspace/backend cwd: {plan_path}"
                     ),
+                    platform=source.platform.value if source.platform else "",
+                    source_surface="gateway",
+                    telemetry_session_id=_get_command_session_id(),
+                    gateway_session_key=_get_command_session_key(),
+                    user_id=source.user_id or "",
+                    chat_id=getattr(source, "chat_id", "") or "",
+                    thread_id=getattr(source, "thread_id", "") or "",
+                    message_id=getattr(event, "message_id", "") or "",
                 )
                 if not event.text:
                     return "Failed to load the bundled /plan skill."
                 canonical = None
+                command = None
             except Exception as e:
                 logger.exception("Failed to prepare /plan command")
                 return f"Failed to enter plan mode: {e}"
@@ -3703,6 +3703,7 @@ class GatewayRunner:
             if command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "exec":
+                    _track_command("quick-exec", raw_command=f"/{command}", canonical_name=command)
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
@@ -3727,6 +3728,7 @@ class GatewayRunner:
                         target_command = target.lstrip("/")
                         user_args = event.get_command_args().strip()
                         event.text = f"{target} {user_args}".strip()
+                        _track_command("quick-alias", raw_command=f"/{command}", canonical_name=command, redirect_target=target_command)
                         command = target_command
                         # Fall through to normal command dispatch below
                     else:
@@ -3743,6 +3745,7 @@ class GatewayRunner:
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
+                    _track_command("plugin", raw_command=f"/{command}", canonical_name=command.replace("_", "-"))
                     user_args = event.get_command_args().strip()
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
@@ -3765,6 +3768,7 @@ class GatewayRunner:
                 skill_cmds = get_skill_commands()
                 cmd_key = resolve_skill_command_key(command)
                 if cmd_key is not None:
+                    _track_command("skill", raw_command=f"/{command}", canonical_name=cmd_key.lstrip("/"))
                     # Check per-platform disabled status before executing.
                     # get_skill_commands() only applies the *global* disabled
                     # list at scan time; per-platform overrides need checking
@@ -3780,7 +3784,17 @@ class GatewayRunner:
                             )
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key,
+                        user_instruction,
+                        task_id=_quick_key,
+                        platform=source.platform.value if source.platform else "",
+                        source_surface="gateway",
+                        telemetry_session_id=_get_command_session_id(),
+                        gateway_session_key=_get_command_session_key(),
+                        user_id=source.user_id or "",
+                        chat_id=getattr(source, "chat_id", "") or "",
+                        thread_id=getattr(source, "thread_id", "") or "",
+                        message_id=getattr(event, "message_id", "") or "",
                     )
                     if msg:
                         event.text = msg
@@ -4970,11 +4984,6 @@ class GatewayRunner:
         # Clear any session-scoped model override so the next agent picks up
         # the configured default instead of the previously switched model.
         self._session_model_overrides.pop(session_key, None)
-
-        # Clear session-scoped dangerous-command approvals and /yolo state.
-        # /new is a conversation-boundary operation — approval state from the
-        # previous conversation must not survive the reset.
-        self._clear_session_boundary_security_state(session_key)
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:
@@ -7222,7 +7231,6 @@ class GatewayRunner:
         new_entry = self.session_store.switch_session(session_key, target_id)
         if not new_entry:
             return "Failed to switch session."
-        self._clear_session_boundary_security_state(session_key)
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
@@ -7312,7 +7320,6 @@ class GatewayRunner:
         new_entry = self.session_store.switch_session(session_key, new_session_id)
         if not new_entry:
             return "Branch created but failed to switch to it."
-        self._clear_session_boundary_security_state(session_key)
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
@@ -8686,29 +8693,6 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
-
-    def _clear_session_boundary_security_state(self, session_key: str) -> None:
-        """Clear approval state that must not survive a real conversation switch."""
-        if not session_key:
-            return
-
-        pending_approvals = getattr(self, "_pending_approvals", None)
-        if isinstance(pending_approvals, dict):
-            pending_approvals.pop(session_key, None)
-
-        try:
-            from tools.approval import clear_session as _clear_approval_session
-        except Exception:
-            return
-
-        try:
-            _clear_approval_session(session_key)
-        except Exception as e:
-            logger.debug(
-                "Failed to clear approval state for session boundary %s: %s",
-                session_key,
-                e,
-            )
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh run generation token for ``session_key``.
@@ -10876,13 +10860,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # The PID file is scoped to HERMES_HOME, so future multi-profile
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
-    from gateway.status import (
-        acquire_gateway_runtime_lock,
-        get_running_pid,
-        release_gateway_runtime_lock,
-        remove_pid_file,
-        terminate_pid,
-    )
+    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
@@ -11095,21 +11073,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Exiting to avoid double-running.", _current_pid
         )
         return False
-    if not acquire_gateway_runtime_lock():
-        logger.error(
-            "Gateway runtime lock is already held by another instance. Exiting."
-        )
-        return False
     try:
         write_pid_file()
     except FileExistsError:
-        release_gateway_runtime_lock()
         logger.error(
             "PID file race lost to another gateway instance. Exiting."
         )
         return False
     atexit.register(remove_pid_file)
-    atexit.register(release_gateway_runtime_lock)
 
     # Start the gateway
     success = await runner.start()
