@@ -481,13 +481,34 @@ class TestGetDueJobs:
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
         save_jobs(jobs)
 
-        due = get_due_jobs()
+        with patch("cron.jobs._emit_monitoring_schedule_violation") as monitor_mock:
+            due = get_due_jobs()
         assert len(due) == 0
+        monitor_mock.assert_called_once()
+        call_args = monitor_mock.call_args
+        assert call_args.args[0] == job["id"]
+        assert call_args.args[2] == "missed"
         # next_run_at should be fast-forwarded to the future
         updated = get_job(job["id"])
         from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+
+    def test_late_due_job_emits_late_monitoring_event(self, tmp_cron_dir):
+        job = create_job(prompt="Late", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        save_jobs(jobs)
+
+        with patch("cron.jobs._emit_monitoring_schedule_violation") as monitor_mock:
+            due = get_due_jobs()
+
+        assert len(due) == 1
+        assert due[0]["id"] == job["id"]
+        monitor_mock.assert_called_once()
+        call_args = monitor_mock.call_args
+        assert call_args.args[0] == job["id"]
+        assert call_args.args[2] == "late"
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")

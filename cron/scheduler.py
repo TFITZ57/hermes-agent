@@ -14,8 +14,10 @@ import contextvars
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -89,6 +91,100 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+def get_monitor_store():
+    """Return the best-effort monitor store writer for cron monitoring facts."""
+    try:
+        from cron.monitor_store import get_monitor_store as _get_monitor_store
+
+        return _get_monitor_store()
+    except Exception as exc:
+        logger.debug("Monitor store unavailable: %s", exc)
+        return None
+
+
+def _safe_reconcile_stale_runs(store, now) -> None:
+    if store is None:
+        return
+    try:
+        count = store.reconcile_stale_runs(now)
+        if count:
+            logger.warning("Reconciled %s stale running cron monitor row(s)", count)
+    except Exception as exc:
+        logger.warning("Failed to reconcile stale cron monitor rows: %s", exc)
+
+
+def _safe_record_run_start(store, job: dict, session_id: str, started_at: datetime):
+    if store is None:
+        return None
+    try:
+        from cron.monitor_store import MonitorRunStart
+
+        expected_run_at = None
+        if job.get("next_run_at"):
+            try:
+                expected_run_at = datetime.fromisoformat(job["next_run_at"])
+            except Exception:
+                expected_run_at = None
+
+        return store.record_run_start(
+            MonitorRunStart(
+                job_id=job["id"],
+                session_id=session_id,
+                host=socket.gethostname() or "unknown-host",
+                environment=str(job.get("environment") or "production"),
+                expected_run_at=expected_run_at,
+                started_at=started_at,
+                timeout_seconds=float(job.get("timeout")) if job.get("timeout") is not None else None,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Failed to record cron monitor run start for %s: %s", job.get("id", "?"), exc)
+        return None
+
+
+def _safe_record_run_finish(store, *, run_id, job: dict, session_id: str, state: str, started_at: datetime, ended_at: datetime, output_path: str | None, final_response: str | None, error: str | None, delivery_error: str | None) -> None:
+    if store is None:
+        return
+    try:
+        from cron.monitor_store import MonitorRunFinish
+
+        excerpt = (final_response or "").strip()
+        if len(excerpt) > 280:
+            excerpt = excerpt[:277] + "..."
+        duration_ms = max(0, int((ended_at - started_at).total_seconds() * 1000))
+        store.record_run_finish(
+            MonitorRunFinish(
+                run_id=run_id,
+                job_id=job["id"],
+                session_id=session_id,
+                state=state,
+                ended_at=ended_at,
+                duration_ms=duration_ms,
+                output_path=output_path,
+                final_response_excerpt=excerpt or None,
+                error_message=error,
+                delivery_error=delivery_error,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Failed to record cron monitor run finish for %s: %s", job.get("id", "?"), exc)
+
+
+def _safe_record_delivery_attempt(store, *, job: dict, run_id: str | None, delivery_state: str, error_message: str | None, payload: dict | None = None) -> None:
+    if store is None:
+        return
+    try:
+        store.record_delivery_attempt(
+            job["id"],
+            run_id,
+            delivery_state=delivery_state,
+            error_message=error_message,
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record cron delivery attempt for %s: %s", job.get("id", "?"), exc)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -663,6 +759,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         return prompt
 
     from tools.skills_tool import skill_view
+    from agent.runtime_event_telemetry import emit_skill_activate
 
     parts = []
     skipped: list[str] = []
@@ -675,6 +772,17 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         content = str(loaded.get("content") or "").strip()
+        emit_skill_activate(
+            skill_name=skill_name,
+            activation_mode="cron-attached",
+            source_surface="cron",
+            platform="cron",
+            session_id="",
+            skill_identifier=skill_name,
+            instruction_chars=0,
+            runtime_note_chars=0,
+            skill_dir="",
+        )
         if parts:
             parts.append("")
         parts.extend(
@@ -1066,6 +1174,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
+        store = get_monitor_store()
+        _safe_reconcile_stale_runs(store, _hermes_now())
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
@@ -1109,6 +1219,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            run_started_at = _hermes_now()
+            run_id = _safe_record_run_start(store, job, f"cron_{job['id']}_{run_started_at.strftime('%Y%m%d_%H%M%S')}", run_started_at)
             try:
                 success, output, final_response, error = run_job(job)
 
@@ -1118,33 +1230,84 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
+                # output is already saved above). Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                    logger.info("Job '%s': agent returned %s - skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
                 delivery_error = None
                 if should_deliver:
                     try:
                         delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        _safe_record_delivery_attempt(
+                            store,
+                            job=job,
+                            run_id=run_id,
+                            delivery_state="delivered" if not delivery_error else "delivery_error",
+                            error_message=delivery_error,
+                            payload={"deliver": job.get("deliver", "local")},
+                        )
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+                        _safe_record_delivery_attempt(
+                            store,
+                            job=job,
+                            run_id=run_id,
+                            delivery_state="delivery_error",
+                            error_message=delivery_error,
+                            payload={"deliver": job.get("deliver", "local")},
+                        )
 
                 # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
+                # is not "ok" - the agent ran but produced nothing useful.
                 # (issue #8585)
+                state = "complete"
                 if success and not final_response:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                if not success:
+                    lowered_error = (error or "").lower()
+                    if "idle for" in lowered_error or "timed out" in lowered_error:
+                        state = "timeout"
+                    else:
+                        state = "fail"
+                elif final_response and SILENT_MARKER in final_response.strip().upper():
+                    state = "skipped"
 
+                _safe_record_run_finish(
+                    store,
+                    run_id=run_id,
+                    job=job,
+                    session_id=f"cron_{job['id']}_{run_started_at.strftime('%Y%m%d_%H%M%S')}",
+                    state=state,
+                    started_at=run_started_at,
+                    ended_at=_hermes_now(),
+                    output_path=str(output_file),
+                    final_response=final_response,
+                    error=error,
+                    delivery_error=delivery_error,
+                )
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
+                _safe_record_run_finish(
+                    store,
+                    run_id=run_id,
+                    job=job,
+                    session_id=f"cron_{job['id']}_{run_started_at.strftime('%Y%m%d_%H%M%S')}",
+                    state="fail",
+                    started_at=run_started_at,
+                    ended_at=_hermes_now(),
+                    output_path=None,
+                    final_response=None,
+                    error=str(e),
+                    delivery_error=None,
+                )
                 mark_job_run(job["id"], False, str(e))
                 return False
 
