@@ -95,6 +95,21 @@ def ensure_dirs():
     _secure_dir(OUTPUT_DIR)
 
 
+def _emit_monitoring_schedule_violation(job_id: str, expected_run_at: datetime, event_type: str, summary: str) -> None:
+    """Best-effort hook into the monitoring runtime when a job is overdue or missed."""
+    try:
+        from cron.monitor_store import get_monitor_store
+
+        get_monitor_store().record_schedule_violation(
+            job_id,
+            expected_run_at=expected_run_at,
+            event_type=event_type,
+            summary=summary,
+        )
+    except Exception as exc:
+        logger.debug("monitoring schedule violation emit skipped for %s: %s", job_id, exc)
+
+
 # =============================================================================
 # Schedule Parsing
 # =============================================================================
@@ -714,14 +729,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
         if next_run_dt <= now:
             schedule = job.get("schedule", {})
             kind = schedule.get("kind")
+            overdue_seconds = max(0, int((now - next_run_dt).total_seconds()))
 
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
+            if kind in ("cron", "interval") and overdue_seconds > grace:
+                # Job is past its catch-up grace window; this is a stale missed run.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
                     logger.info(
@@ -732,6 +747,12 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                         grace,
                         new_next,
                     )
+                    _emit_monitoring_schedule_violation(
+                        job["id"],
+                        next_run_dt,
+                        "missed",
+                        f"Job missed its scheduled time and was fast-forwarded to {new_next}",
+                    )
                     # Update the job in storage
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
@@ -739,6 +760,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                             needs_save = True
                             break
                     continue  # Skip this run
+
+            if kind in ("cron", "interval") and overdue_seconds > 60:
+                _emit_monitoring_schedule_violation(
+                    job["id"],
+                    next_run_dt,
+                    "late",
+                    f"Job is running late by {overdue_seconds} seconds",
+                )
 
             due.append(job)
 
