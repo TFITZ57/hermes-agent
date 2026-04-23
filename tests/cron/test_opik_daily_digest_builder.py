@@ -169,8 +169,11 @@ def test_main_calls_daily_rollup_builder_path_before_printing_markdown(monkeypat
         calls.append("write")
         return latest_path, dated_path
 
+    captured = {}
+
     def fake_persist_daily_rollup(payload, markdown_report=None):
         calls.append("persist")
+        captured["markdown_report"] = markdown_report
         return 123
 
     monkeypatch.setattr("cron.opik_daily_rollup_builder.build_daily_rollup", fake_build_daily_rollup)
@@ -183,3 +186,4 @@ def test_main_calls_daily_rollup_builder_path_before_printing_markdown(monkeypat
     assert calls[:3] == ["build", "write", "persist"]
     assert "# Hermes Opik Daily Digest" in output
     assert "```json" in output
+    assert captured["markdown_report"] == output.rstrip("\n")

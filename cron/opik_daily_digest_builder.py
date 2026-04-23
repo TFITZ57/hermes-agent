@@ -298,11 +298,12 @@ def main() -> None:
     latest, dated = daily_rollup_builder.write_structured_outputs(rollup, daily_rollup_builder.OUT_DIR, report_date)
     rollup.setdefault("collection", {})["path_latest"] = str(latest)
     rollup.setdefault("collection", {})["path_stamped"] = str(dated)
-    rollup_persistence.persist_daily_rollup(rollup)
+    markdown = render_daily_digest(rollup)
+    rollup_persistence.persist_daily_rollup(rollup, markdown_report=markdown)
     payload = json.dumps(rollup, indent=2)
     latest.write_text(payload)
     dated.write_text(payload)
-    print(render_daily_digest(rollup))
+    print(markdown)
 
 
 if __name__ == "__main__":
