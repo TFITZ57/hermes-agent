@@ -169,6 +169,20 @@ class TestBuildOAuthAuth:
         assert provider is not None
         assert provider.context.client_metadata.scope == "read write admin"
 
+    def test_preserves_mcp_path_when_building_provider(self, tmp_path, monkeypatch):
+        try:
+            from mcp.client.auth import OAuthClientProvider
+        except ImportError:
+            pytest.skip("MCP SDK auth not available")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        provider = build_oauth_auth(
+            "supabase_hq",
+            "https://mcp.supabase.com/mcp?project_ref=eobqnofmbfwgwsnvbazs&read_only=true&features=docs,database",
+        )
+        assert provider is not None
+        assert provider.context.server_url == "https://mcp.supabase.com/mcp"
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -491,11 +505,11 @@ def test_configure_callback_port_uses_explicit_port():
     assert cfg["_resolved_port"] == 54321
 
 
-def test_parse_base_url_strips_path():
-    """_parse_base_url drops path components for OAuth discovery."""
+def test_parse_base_url_preserves_endpoint_path_and_drops_query():
+    """_parse_base_url keeps the MCP path but drops query parameters."""
     from tools.mcp_oauth import _parse_base_url
 
-    assert _parse_base_url("https://example.com/mcp/v1") == "https://example.com"
+    assert _parse_base_url("https://example.com/mcp/v1?foo=bar") == "https://example.com/mcp/v1"
     assert _parse_base_url("https://example.com") == "https://example.com"
-    assert _parse_base_url("https://host.example.com:8080/api") == "https://host.example.com:8080"
+    assert _parse_base_url("https://host.example.com:8080/api") == "https://host.example.com:8080/api"
 

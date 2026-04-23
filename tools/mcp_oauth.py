@@ -513,9 +513,9 @@ def _maybe_preregister_client(
 
 
 def _parse_base_url(server_url: str) -> str:
-    """Strip path component from server URL, returning the base origin."""
+    """Drop query and fragment, but preserve the MCP endpoint path."""
     parsed = urlparse(server_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
 
 
 def build_oauth_auth(
