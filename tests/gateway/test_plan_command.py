@@ -90,6 +90,24 @@ Save plans under the active workspace's .hermes/plans directory.
 
 class TestGatewayPlanCommand:
     @pytest.mark.asyncio
+    async def test_builtin_command_emits_command_execute(self, monkeypatch):
+        runner = _make_runner()
+        event = _make_event("/status")
+
+        with patch("agent.runtime_event_telemetry.emit_command_execute") as mock_emit:
+            result = await runner._handle_message(event)
+
+        assert result is not None
+        mock_emit.assert_called_once()
+        kwargs = mock_emit.call_args.kwargs
+        assert kwargs["raw_command"] == "/status"
+        assert kwargs["canonical_command"] == "status"
+        assert kwargs["command_kind"] == "builtin"
+        assert kwargs["source_surface"] == "gateway"
+        assert kwargs["session_id"] == "sess-1"
+        assert kwargs["gateway_session_key"] == "agent:main:telegram:dm:c1:u1"
+
+    @pytest.mark.asyncio
     async def test_plan_command_loads_skill_and_runs_agent(self, monkeypatch, tmp_path):
         import gateway.run as gateway_run
 
@@ -102,7 +120,9 @@ class TestGatewayPlanCommand:
             lambda *_args, **_kwargs: 100_000,
         )
 
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "agent.skill_commands.emit_skill_activate"
+        ) as mock_skill_emit:
             _make_plan_skill(tmp_path)
             scan_skill_commands()
             result = await runner._handle_message(event)
@@ -115,6 +135,14 @@ class TestGatewayPlanCommand:
         assert str(tmp_path / "plans") not in forwarded
         assert "active workspace/backend cwd" in forwarded
         assert "Runtime note:" in forwarded
+        mock_skill_emit.assert_called_once()
+        skill_kwargs = mock_skill_emit.call_args.kwargs
+        assert skill_kwargs["activation_mode"] == "slash"
+        assert skill_kwargs["source_surface"] == "gateway"
+        assert skill_kwargs["platform"] == "telegram"
+        assert skill_kwargs["session_id"] == "sess-1"
+        assert skill_kwargs["gateway_session_key"] == "agent:main:telegram:dm:c1:u1"
+        assert skill_kwargs["command_name"] == "plan"
 
     @pytest.mark.asyncio
     async def test_plan_command_appears_in_help_output_via_skill_listing(self, tmp_path):

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import display_hermes_home
+from agent.runtime_event_telemetry import emit_skill_activate
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +432,15 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
+    *,
+    platform: str = "",
+    source_surface: str = "",
+    telemetry_session_id: str | None = None,
+    gateway_session_key: str = "",
+    user_id: str = "",
+    chat_id: str = "",
+    thread_id: str = "",
+    message_id: str = "",
 ) -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
@@ -451,6 +461,24 @@ def build_skill_invocation_message(
         return f"[Failed to load skill: {skill_info['name']}]"
 
     loaded_skill, skill_dir, skill_name = loaded
+    emit_skill_activate(
+        skill_name=skill_name,
+        activation_mode="slash",
+        source_surface=source_surface or "unknown",
+        platform=platform,
+        session_id=telemetry_session_id or task_id or "",
+        gateway_session_key=gateway_session_key,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        command_name=cmd_key.lstrip("/"),
+        skill_command=cmd_key,
+        skill_identifier=str(skill_info.get("skill_dir") or skill_name),
+        instruction_chars=len(user_instruction or ""),
+        runtime_note_chars=len(runtime_note or ""),
+        skill_dir=str(skill_dir or ""),
+    )
     activation_note = (
         f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"
@@ -468,6 +496,9 @@ def build_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    *,
+    platform: str = "",
+    source_surface: str = "cli",
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI preloading.
 
@@ -490,6 +521,19 @@ def build_preloaded_skills_prompt(
             continue
 
         loaded_skill, skill_dir, skill_name = loaded
+        emit_skill_activate(
+            skill_name=skill_name,
+            activation_mode="preloaded",
+            source_surface=source_surface or "cli",
+            platform=platform,
+            session_id=task_id or "",
+            command_name="",
+            skill_command="",
+            skill_identifier=identifier,
+            instruction_chars=0,
+            runtime_note_chars=0,
+            skill_dir=str(skill_dir or ""),
+        )
         activation_note = (
             f'[SYSTEM: The user launched this CLI session with the "{skill_name}" skill '
             "preloaded. Treat its instructions as active guidance for the duration of this "

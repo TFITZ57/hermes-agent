@@ -14,6 +14,7 @@ def _make_cli():
     cli_obj.conversation_history = []
     cli_obj.session_id = "sess-123"
     cli_obj._pending_input = MagicMock()
+    cli_obj.show_help = MagicMock()
     return cli_obj
 
 
@@ -35,6 +36,22 @@ Save plans under the active workspace's .hermes/plans directory.
 
 
 class TestCLIPlanCommand:
+    def test_builtin_command_emits_command_execute(self):
+        cli_obj = _make_cli()
+
+        with patch("agent.runtime_event_telemetry.emit_command_execute") as mock_emit:
+            result = cli_obj.process_command("/help")
+
+        assert result is True
+        cli_obj.show_help.assert_called_once()
+        mock_emit.assert_called_once()
+        kwargs = mock_emit.call_args.kwargs
+        assert kwargs["raw_command"] == "/help"
+        assert kwargs["canonical_command"] == "help"
+        assert kwargs["command_kind"] == "builtin"
+        assert kwargs["source_surface"] == "cli"
+        assert kwargs["session_id"] == "sess-123"
+
     def test_plan_command_queues_plan_skill_message(self, tmp_path, monkeypatch):
         cli_obj = _make_cli()
 

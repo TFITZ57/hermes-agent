@@ -218,6 +218,28 @@ class TestBuildPreloadedSkillsPrompt:
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
 
+    def test_emits_skill_activate_for_preloaded_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "agent.skill_commands.emit_skill_activate"
+        ) as mock_emit:
+            _make_skill(tmp_path, "first-skill")
+            _make_skill(tmp_path, "second-skill")
+            build_preloaded_skills_prompt(
+                ["first-skill", "second-skill"],
+                task_id="session-1",
+                platform="cli",
+                source_surface="cli",
+            )
+
+        assert mock_emit.call_count == 2
+        first = mock_emit.call_args_list[0].kwargs
+        second = mock_emit.call_args_list[1].kwargs
+        assert first["skill_name"] == "first-skill"
+        assert first["activation_mode"] == "preloaded"
+        assert first["session_id"] == "session-1"
+        assert second["skill_name"] == "second-skill"
+        assert second["activation_mode"] == "preloaded"
+
 
 class TestBuildSkillInvocationMessage:
     def test_loads_skill_by_stored_path_when_frontmatter_name_differs(self, tmp_path):
@@ -252,6 +274,37 @@ Generate some audio.
         assert msg is not None
         assert "test-skill" in msg
         assert "do stuff" in msg
+
+    def test_emits_skill_activate_for_slash_invocation(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "agent.skill_commands.emit_skill_activate"
+        ) as mock_emit:
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                "do stuff",
+                task_id="task-1",
+                platform="telegram",
+                source_surface="gateway",
+                telemetry_session_id="session-telemetry",
+                gateway_session_key="gateway-key-1",
+                user_id="user-1",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                message_id="msg-1",
+            )
+
+        assert msg is not None
+        mock_emit.assert_called_once()
+        kwargs = mock_emit.call_args.kwargs
+        assert kwargs["skill_name"] == "test-skill"
+        assert kwargs["activation_mode"] == "slash"
+        assert kwargs["source_surface"] == "gateway"
+        assert kwargs["session_id"] == "session-telemetry"
+        assert kwargs["gateway_session_key"] == "gateway-key-1"
+        assert kwargs["command_name"] == "test-skill"
+        assert kwargs["instruction_chars"] == len("do stuff")
 
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
