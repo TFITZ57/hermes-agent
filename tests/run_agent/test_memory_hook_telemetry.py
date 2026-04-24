@@ -250,7 +250,7 @@ def test_invoke_tool_memory_provider_path_records_precheck_and_post_hook(agent_w
         return []
 
     with (
-        patch("hermes_cli.plugins.get_pre_tool_call_block_message", precheck),
+        patch("run_agent._get_pre_tool_call_block_message", precheck),
         patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
     ):
         result = agent._invoke_tool("brv_query", {"query": "opik"}, "task-1", tool_call_id="tool-1")
@@ -290,7 +290,7 @@ def test_execute_tool_calls_sequential_session_search_records_precheck_and_post_
         return []
 
     with (
-        patch("hermes_cli.plugins.get_pre_tool_call_block_message", precheck),
+        patch("run_agent._get_pre_tool_call_block_message", precheck),
         patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
         patch("tools.session_search_tool.session_search", return_value='{"success": true, "results": []}'),
     ):
