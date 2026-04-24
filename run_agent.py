@@ -29,6 +29,19 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 _TOOL_BLOCK_CHECK_NOT_RUN = object()
+
+
+def _get_pre_tool_call_block_message(*args, **kwargs):
+    """Return a plugin pre-tool block message, if any.
+
+    Kept as a module-level indirection so tests can patch a stable lookup point
+    even when other suites reset the plugin manager or reload plugin modules.
+    """
+    from hermes_cli.plugins import get_pre_tool_call_block_message
+
+    return get_pre_tool_call_block_message(*args, **kwargs)
+
+
 import os
 import random
 import re
@@ -7702,8 +7715,7 @@ class AIAgent:
         if block_message is _TOOL_BLOCK_CHECK_NOT_RUN:
             block_message = None
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
+                block_message = _get_pre_tool_call_block_message(
                     function_name,
                     function_args,
                     task_id=effective_task_id or "",
@@ -8124,8 +8136,7 @@ class AIAgent:
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
+                _block_msg = _get_pre_tool_call_block_message(
                     function_name,
                     function_args,
                     task_id=effective_task_id or "",
