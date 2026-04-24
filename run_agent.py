@@ -7714,8 +7714,11 @@ class AIAgent:
                 )
             except Exception:
                 pass
-        if block_message is not None:
+        if isinstance(block_message, str) and block_message:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+        if block_message is not None:
+            logger.debug("Ignoring non-string pre-tool block message for %s: %r", function_name, block_message)
+            block_message = None
 
         handled_directly, direct_result = self._dispatch_direct_tool(
             function_name,

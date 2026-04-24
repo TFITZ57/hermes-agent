@@ -36,6 +36,11 @@ from hermes_cli import config as hermes_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
+
+def load_config():
+    """Patchable config shim that still follows hermes_cli.config monkeypatches."""
+    return hermes_config.load_config()
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -108,7 +113,7 @@ def _managed_persistence_enabled() -> bool:
     Controlled by ``browser.camofox.managed_persistence`` in config.yaml.
     """
     try:
-        camofox_cfg = hermes_config.load_config().get("browser", {}).get("camofox", {})
+        camofox_cfg = load_config().get("browser", {}).get("camofox", {})
     except Exception as exc:
         logger.warning("managed_persistence check failed, defaulting to disabled: %s", exc)
         return False
@@ -543,7 +548,7 @@ def camofox_vision(question: str, annotate: bool = False,
         )
 
         try:
-            _cfg = hermes_config.load_config()
+            _cfg = load_config()
             _vision_cfg = _cfg.get("auxiliary", {}).get("vision", {})
             _vision_timeout = float(_vision_cfg.get("timeout", 120))
             _vision_temperature = float(_vision_cfg.get("temperature", 0.1))

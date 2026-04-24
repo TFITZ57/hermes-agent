@@ -4,7 +4,10 @@ import json
 import os
 from typing import Any
 
-import psycopg
+try:
+    import psycopg
+except ImportError:  # pragma: no cover - depends on optional postgres extra
+    psycopg = None
 
 
 JSON = dict[str, Any]
@@ -434,6 +437,12 @@ def _prepare_values(columns: list[str], row: JSON) -> list[Any]:
     return values
 
 
+def _connect(dsn: str):
+    if psycopg is None:
+        raise RuntimeError("psycopg is required to persist Opik rollups")
+    return psycopg.connect(dsn, connect_timeout=10)
+
+
 def persist_hourly_rollup(report: JSON, dsn: str | None = None) -> int:
     dsn = dsn or get_hq_postgres_dsn()
     base = build_hourly_rollup_base(report)
@@ -445,7 +454,7 @@ def persist_hourly_rollup(report: JSON, dsn: str | None = None) -> int:
     value_exprs = ", ".join(f"%s::jsonb" if c in _JSON_COLUMNS else "%s" for c in _HOURLY_BASE_COLUMNS)
     update_clause = ", ".join(f"{col} = excluded.{col}" for col in _HOURLY_BASE_COLUMNS if col not in {"project_name", "window_to_utc"})
 
-    with psycopg.connect(dsn, connect_timeout=10) as conn:
+    with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -536,7 +545,7 @@ def persist_daily_rollup(rollup: JSON, markdown_report: str | None = None, dsn: 
     value_exprs = ", ".join(f"%s::jsonb" if c in _JSON_COLUMNS else "%s" for c in _DAILY_BASE_COLUMNS)
     update_clause = ", ".join(f"{col} = excluded.{col}" for col in _DAILY_BASE_COLUMNS if col not in {"project_name", "report_date"})
 
-    with psycopg.connect(dsn, connect_timeout=10) as conn:
+    with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
