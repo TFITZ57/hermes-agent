@@ -32,9 +32,14 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from hermes_cli.config import load_config
+from hermes_cli import config as hermes_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
+
+
+def load_config():
+    """Patchable config shim that still follows hermes_cli.config monkeypatches."""
+    return hermes_config.load_config()
 
 logger = logging.getLogger(__name__)
 

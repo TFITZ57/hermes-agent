@@ -71,10 +71,11 @@ from model_tools import (
     handle_function_call,
     check_toolset_requirements,
 )
-from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
+from tools.terminal_tool import get_active_env, is_persistent_env
+from tools import terminal_tool as _terminal_tool
+from tools import browser_tool as _browser_tool
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
 
 
 from hermes_constants import OPENROUTER_BASE_URL
@@ -1051,7 +1052,6 @@ class AIAgent:
                     'run_agent',            # agent runner internals
                     'trajectory_compressor',
                     'cron',                 # scheduler (only relevant in daemon mode)
-                    'hermes_cli',           # CLI helpers
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
@@ -2037,7 +2037,7 @@ class AIAgent:
         new_norm = (new_provider or "").strip().lower()
         if old_norm and new_norm and old_norm != new_norm:
             self._fallback_chain = [
-                entry for entry in self._fallback_chain
+                entry for entry in getattr(self, "_fallback_chain", [])
                 if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
             ]
             self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
@@ -2535,6 +2535,17 @@ class AIAgent:
         content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        # Some open models emit tool-call XML in assistant text instead of
+        # structured tool_calls. Strip standalone blocks so they do not leak
+        # to gateway or CLI users, while preserving prose examples.
+        content = re.sub(r'<tool_call\b[^>]*>.*?</tool_call>\s*', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<function_calls\b[^>]*>.*?</function_calls>\s*', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(
+            r'(^|[\r\n]|[.!?:]\s+)[ \t]*<function\b[^>]*\bname\s*=\s*(["\']).*?\2[^>]*>.*?</function>\s*',
+            r'\1',
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         # 2. Unterminated reasoning block — open tag at a block boundary
         #    (start of text, or after a newline) with no matching close.
         #    Strip from the tag to end of string.  Fixes #8878 / #9568
@@ -2547,7 +2558,7 @@ class AIAgent:
         )
         # 3. Stray orphan open/close tags that slipped through.
         content = re.sub(
-            r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
+            r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD|function)>\s*',
             '',
             content,
             flags=re.IGNORECASE,
@@ -2765,12 +2776,12 @@ class AIAgent:
                         f"idle reaper will handle it."
                     )
             else:
-                cleanup_vm(task_id)
+                _terminal_tool.cleanup_vm(task_id)
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to cleanup VM for task {task_id}: {e}")
         try:
-            cleanup_browser(task_id)
+            _browser_tool.cleanup_browser(task_id)
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to cleanup browser for task {task_id}: {e}")
@@ -3914,13 +3925,13 @@ class AIAgent:
 
         # 2. Clean terminal sandbox environments
         try:
-            cleanup_vm(task_id)
+            _terminal_tool.cleanup_vm(task_id)
         except Exception:
             pass
 
         # 3. Clean browser daemon sessions
         try:
-            cleanup_browser(task_id)
+            _browser_tool.cleanup_browser(task_id)
         except Exception:
             pass
 
@@ -5870,6 +5881,7 @@ class AIAgent:
 
             try:
                 for _stream_attempt in range(_max_stream_retries + 1):
+                    _partial_tool_count_before_attempt = len(result.get("partial_tool_names") or [])
                     try:
                         if self.api_mode == "anthropic_messages":
                             self._try_refresh_anthropic_client_credentials()
@@ -5878,16 +5890,6 @@ class AIAgent:
                             result["response"] = _call_chat_completions()
                         return  # success
                     except Exception as e:
-                        if deltas_were_sent["yes"]:
-                            # Streaming failed AFTER some tokens were already
-                            # delivered.  Don't retry or fall back — partial
-                            # content already reached the user.
-                            logger.warning(
-                                "Streaming failed after partial delivery, not retrying: %s", e
-                            )
-                            result["error"] = e
-                            return
-
                         _is_timeout = isinstance(
                             e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                         )
@@ -5925,9 +5927,30 @@ class AIAgent:
                                     for phrase in _SSE_CONN_PHRASES
                                 )
 
+                        _stream_attempt_started_tool = (
+                            len(result.get("partial_tool_names") or [])
+                            > _partial_tool_count_before_attempt
+                        )
+
+                        if deltas_were_sent["yes"] and not _stream_attempt_started_tool:
+                            # Streaming failed AFTER normal assistant text was
+                            # already delivered. Don't retry or fall back —
+                            # partial content already reached the user. Mid-tool
+                            # failures are handled by the transient retry path
+                            # below because no complete action was delivered.
+                            logger.warning(
+                                "Streaming failed after partial delivery, not retrying: %s", e
+                            )
+                            result["error"] = e
+                            return
+
                         if _is_timeout or _is_conn_err or _is_sse_conn_err:
                             # Transient network / timeout error. Retry the
                             # streaming request with a fresh connection first.
+                            # If assistant text was already streamed before a
+                            # tool call began, still retry: no durable action
+                            # was delivered, and dropping the partial tool call
+                            # silently loses the model's intended action.
                             if _stream_attempt < _max_stream_retries:
                                 logger.info(
                                     "Streaming attempt %s/%s failed (%s: %s), "
@@ -5937,6 +5960,12 @@ class AIAgent:
                                     type(e).__name__,
                                     e,
                                 )
+                                _retry_marker = (
+                                    f"\n\n⚠️ Connection to provider dropped "
+                                    f"({type(e).__name__}); reconnecting "
+                                    f"(attempt {_stream_attempt + 2}/{_max_stream_retries + 1})...\n\n"
+                                )
+                                self._fire_stream_delta(_retry_marker)
                                 self._emit_status(
                                     f"⚠️ Connection to provider dropped "
                                     f"({type(e).__name__}). Reconnecting… "
@@ -6205,6 +6234,10 @@ class AIAgent:
             # falling through to OpenRouter defaults.
             fb_base_url_hint = (fb.get("base_url") or "").strip() or None
             fb_api_key_hint = (fb.get("api_key") or "").strip() or None
+            if not fb_api_key_hint:
+                fb_key_env = (fb.get("key_env") or "").strip()
+                if fb_key_env:
+                    fb_api_key_hint = os.getenv(fb_key_env) or None
             # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
             # when no explicit key is in the fallback config. Host match
             # (not substring) — see GHSA-76xc-57q6-vm5m.
@@ -7680,8 +7713,11 @@ class AIAgent:
                 )
             except Exception:
                 pass
-        if block_message is not None:
+        if isinstance(block_message, str) and block_message:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+        if block_message is not None:
+            logger.debug("Ignoring non-string pre-tool block message for %s: %r", function_name, block_message)
+            block_message = None
 
         handled_directly, direct_result = self._dispatch_direct_tool(
             function_name,
@@ -7698,13 +7734,17 @@ class AIAgent:
                 tool_call_id=tool_call_id,
             )
 
+        tool_call_kwargs = {
+            "tool_call_id": tool_call_id,
+            "session_id": self.session_id or "",
+            "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+            "skip_pre_tool_call_hook": True,
+        }
+        if self._parent_session_id:
+            tool_call_kwargs["parent_session_id"] = self._parent_session_id
         return handle_function_call(
             function_name, function_args, effective_task_id,
-            tool_call_id=tool_call_id,
-            session_id=self.session_id or "",
-            enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-            skip_pre_tool_call_hook=True,
-            parent_session_id=self._parent_session_id or "",
+            **tool_call_kwargs,
         )
 
     @staticmethod
@@ -7859,7 +7899,23 @@ class AIAgent:
                 pass
             start = time.time()
             try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
+                try:
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                    )
+                except TypeError as tool_error:
+                    if "unexpected keyword argument 'messages'" not in str(tool_error):
+                        raise
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                    )
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -8967,9 +9023,7 @@ class AIAgent:
         if self._memory_manager:
             try:
                 _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-                self._memory_manager.on_turn_start(
-                    self._user_turn_count,
-                    _turn_msg,
+                self._memory_manager.on_turn_start(self._user_turn_count, _turn_msg,
                     session_id=self.session_id or "",
                     model=self.model or "",
                     platform=getattr(self, "platform", None) or "",
@@ -11888,6 +11942,7 @@ class AIAgent:
                     conversation_history=list(messages),
                     model=self.model,
                     platform=getattr(self, "platform", None) or "",
+                    parent_session_id=self._parent_session_id or "",
                 )
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
@@ -12009,6 +12064,7 @@ class AIAgent:
                 interrupted=interrupted,
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
+                parent_session_id=self._parent_session_id or "",
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)

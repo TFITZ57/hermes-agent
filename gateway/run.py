@@ -1047,6 +1047,20 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _clear_session_boundary_security_state(self, session_key: str) -> None:
+        """Clear approval and pending-command state for one session boundary."""
+        if not session_key:
+            return
+        try:
+            from tools.approval import clear_session as _clear_approval_session
+            _clear_approval_session(session_key)
+        except Exception as exc:
+            logger.debug("Failed to clear approval state for session %s: %s", session_key, exc)
+
+        pending = getattr(self, "_pending_approvals", None)
+        if isinstance(pending, dict):
+            pending.pop(session_key, None)
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -3489,7 +3503,11 @@ class GatewayRunner:
         # Emit command:* hook for any recognized slash command.
         # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
         # in hermes_cli/commands.py — no hardcoded set to maintain here.
-        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command as _resolve_cmd
+        from hermes_cli.commands import (
+            GATEWAY_KNOWN_COMMANDS,
+            is_gateway_known_command as _is_gateway_known_command,
+            resolve_command as _resolve_cmd,
+        )
         from agent.runtime_event_telemetry import emit_command_execute as _emit_command_execute
         _telemetry_session_entry = [None]
 
@@ -3528,17 +3546,82 @@ class GatewayRunner:
                 active_agent_running=bool(self._running_agents.get(_quick_key)),
             )
 
-        if command and command in GATEWAY_KNOWN_COMMANDS:
-            await self.hooks.emit(f"command:{command}", {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "command": command,
-                "args": event.get_command_args().strip(),
-            })
-
         # Resolve aliases to canonical name so dispatch only checks canonicals.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        async def _collect_command_decision(command_name: str, canonical_name: str | None):
+            hook_name = (canonical_name or command_name or "").replace("_", "-")
+            if not hook_name or not hasattr(self.hooks, "emit_collect"):
+                return None
+            payload = {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": hook_name,
+                "raw_command": command_name or hook_name,
+                "args": event.get_command_args().strip(),
+                "raw_args": event.get_command_args().strip(),
+                "session_key": _get_command_session_key(),
+                "session_id": _get_command_session_id(),
+                "message_id": getattr(event, "message_id", "") or "",
+            }
+            try:
+                decisions = await self.hooks.emit_collect(f"command:{hook_name}", payload)
+            except Exception as exc:
+                logger.debug("command:%s hook decision failed: %s", hook_name, exc)
+                return None
+            for item in decisions or []:
+                if not isinstance(item, dict):
+                    continue
+                decision = str(item.get("decision", "")).strip().lower()
+                if decision == "deny":
+                    return {"action": "deny", "message": item.get("message")}
+                if decision == "handled":
+                    return {"action": "handled", "message": item.get("message")}
+                if decision == "rewrite":
+                    return {"action": "rewrite", "item": item}
+                if decision == "allow":
+                    continue
+            return None
+
+        if command and _is_gateway_known_command(command):
+            _decision = await _collect_command_decision(command, canonical)
+            if _decision:
+                action = _decision.get("action")
+                if action == "deny":
+                    return _decision.get("message") or "Command blocked by policy."
+                if action == "handled":
+                    return _decision.get("message")
+                if action == "rewrite":
+                    item = _decision.get("item") or {}
+                    rewritten = str(
+                        item.get("command_name")
+                        or item.get("command")
+                        or item.get("target_command")
+                        or ""
+                    ).strip()
+                    raw_args = str(item.get("raw_args", item.get("args", "")) or "").strip()
+                    if rewritten:
+                        if rewritten.startswith("/"):
+                            parts = rewritten[1:].split(None, 1)
+                        else:
+                            parts = rewritten.split(None, 1)
+                        command = parts[0].strip() if parts else ""
+                        if not raw_args and len(parts) > 1:
+                            raw_args = parts[1].strip()
+                        if command:
+                            event.text = f"/{command} {raw_args}".strip()
+                            _cmd_def = _resolve_cmd(command)
+                            canonical = _cmd_def.name if _cmd_def else command
+
+        if command and _is_gateway_known_command(command):
+            await self.hooks.emit(f"command:{(canonical or command).replace('_', '-')}", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": (canonical or command).replace("_", "-"),
+                "args": event.get_command_args().strip(),
+            })
+
         if _cmd_def:
             _track_command("builtin", raw_command=f"/{command}", canonical_name=canonical)
         elif canonical == "plan" and command:
@@ -4941,6 +5024,7 @@ class GatewayRunner:
         # Get existing session key
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
+        self._clear_session_boundary_security_state(session_key)
         
         # Flush memories in the background (fire-and-forget) so the user
         # gets the "Session reset!" response immediately.
@@ -7224,8 +7308,9 @@ class GatewayRunner:
         except Exception as e:
             logger.debug("Memory flush on resume failed: %s", e)
 
-        # Clear any running agent for this session key
+        # Clear any running agent and session-scoped approval state for this session key
         self._release_running_agent_state(session_key)
+        self._clear_session_boundary_security_state(session_key)
 
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
@@ -7321,8 +7406,9 @@ class GatewayRunner:
         if not new_entry:
             return "Branch created but failed to switch to it."
 
-        # Evict any cached agent for this session
+        # Evict any cached agent and clear session-scoped approval state for this session
         self._evict_cached_agent(session_key)
+        self._clear_session_boundary_security_state(session_key)
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         return (

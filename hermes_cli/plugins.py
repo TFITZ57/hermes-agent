@@ -288,6 +288,7 @@ class PluginContext:
         name: str,
         handler: Callable,
         description: str = "",
+        args_hint: str = "",
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -325,6 +326,7 @@ class PluginContext:
             "handler": handler,
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
+            "args_hint": (args_hint or "").strip(),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
