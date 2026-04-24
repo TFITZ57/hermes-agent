@@ -1052,7 +1052,6 @@ class AIAgent:
                     'run_agent',            # agent runner internals
                     'trajectory_compressor',
                     'cron',                 # scheduler (only relevant in daemon mode)
-                    'hermes_cli',           # CLI helpers
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
