@@ -110,6 +110,28 @@ def _strip_reasoning_tags(text: str) -> str:
     ``_OPEN_THINK_TAGS`` / ``_CLOSE_THINK_TAGS`` tuples.
     """
     cleaned = text
+    # Some open models emit raw tool-call XML in assistant text instead of
+    # structured tool_calls. Strip executable-looking standalone blocks while
+    # preserving prose examples like "Use <function> declarations".
+    cleaned = re.sub(
+        r"<tool_call\b[^>]*>.*?</tool_call>\s*",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"<function_calls\b[^>]*>.*?</function_calls>\s*",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(^|[\r\n]|[.!?:]\s+)[ \t]*<function\b[^>]*\bname\s*=\s*([\"']).*?\2[^>]*>.*?</function>\s*",
+        r"\1",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(r"</function>\s*", "", cleaned, flags=re.IGNORECASE)
     for tag in _REASONING_TAGS:
         # Closed pair — case-insensitive so <THINK>…</THINK> is handled too.
         cleaned = re.sub(
@@ -5857,6 +5879,8 @@ class HermesCLI:
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
 
+        command_session_id = getattr(self, "session_id", "") or ""
+
         def _track_command(kind: str, *, canonical_name: str = "", redirect_target: str = "") -> None:
             _emit_command_execute(
                 raw_command=_base_token,
@@ -5864,7 +5888,7 @@ class HermesCLI:
                 command_kind=kind,
                 source_surface="cli",
                 platform="cli",
-                session_id=self.session_id or "",
+                session_id=command_session_id,
                 args_text=_args_text,
                 redirect_target=redirect_target,
                 active_agent_running=bool(getattr(self, "_agent_running", False)),
@@ -6208,10 +6232,10 @@ class HermesCLI:
                 msg = build_skill_invocation_message(
                     base_cmd,
                     user_instruction,
-                    task_id=self.session_id,
+                    task_id=command_session_id,
                     platform="cli",
                     source_surface="cli",
-                    telemetry_session_id=self.session_id,
+                    telemetry_session_id=command_session_id,
                 )
                 if msg:
                     skill_name = _skill_commands[base_cmd]["name"]
